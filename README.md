@@ -24,13 +24,27 @@ uv run download.py
 Audiobooks are saved under `data/hoerbuecher/<title>/` as `.mp4` files.
 A `done` marker is written when a book is fully downloaded.
 
-### Quick API smoke test
+### List available audiobooks
 
 ```bash
-uv run burn_test.py
+uv run download.py --list
 ```
 
-Verifies all API calls (cookie, list, detail, file resolution, HEAD) without downloading files.
+Shows all titles and their download status.
+
+### Filter by name
+
+```bash
+uv run download.py --filter "Sylt"
+```
+
+Downloads only audiobooks whose title contains the given substring (case-insensitive).
+
+Combine with `--list` to preview matches without downloading:
+
+```bash
+uv run download.py --list --filter "Sylt"
+```
 
 ## How it works
 

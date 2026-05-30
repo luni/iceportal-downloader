@@ -1,0 +1,45 @@
+name: Code Checks
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit Tests & Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Cache uv
+        id: cache-uv
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: uv-cache-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            uv-cache-
+
+      - name: Set up Python environment
+        run: |
+          wget -qO- https://astral.sh/uv/install.sh | sh
+          uv sync
+
+      - name: Run Ruff (Linting)
+        run: |
+          uv run ruff check .
+
+      - name: Run pytest (Unit Tests)
+        run: |
+          uv run pytest -v

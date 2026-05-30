@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import time
 from pathlib import Path
@@ -27,185 +28,194 @@ def parse_http_date(date_str: str) -> float:
     except (TypeError, ValueError):
         return 0
 
-def download_file(url: str, local_filepath: str, session: requests.Session):
-    chunk_size = 1024  # 1kb
+def _resolve_resume_state(
+    head_response: requests.Response, local_filepath: str
+) -> tuple[int, int, str, dict[str, str] | None]:
+    """Return (total_size, decoded_bytes, mode, range_header) for a resumable download."""
+    total_size = int(head_response.headers['Content-Length'])
+    decoded_bytes = 0
 
-    # First make a HEAD request to check headers
+    if os.path.exists(local_filepath):
+        decoded_bytes = os.path.getsize(local_filepath)
+        if decoded_bytes >= total_size:
+            return total_size, 0, 'wb', None  # signal: already done
+
+    mode = 'ab' if decoded_bytes > 0 else 'wb'
+    range_header = None
+
+    if decoded_bytes > 0:
+        if head_response.headers.get('Accept-Ranges') != 'bytes':
+            print("Server does not support byte ranges, downloading from the beginning...")
+            decoded_bytes = 0
+            mode = 'wb'
+        else:
+            range_header = {"Range": f"bytes={decoded_bytes}-"}
+
+    return total_size, decoded_bytes, mode, range_header
+
+
+def _download_simple(
+    url: str, local_filepath: str, session: requests.Session, remote_mtime: float
+) -> None:
+    """Download a file when Content-Length is not available."""
+    with session.get(url, stream=True) as response:
+        response.raise_for_status()
+        os.makedirs(os.path.dirname(os.path.abspath(local_filepath)), exist_ok=True)
+        with open(local_filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=1024):
+                if chunk:
+                    f.write(chunk)
+    if remote_mtime:
+        os.utime(local_filepath, (remote_mtime, remote_mtime))
+
+
+def _download_chunked(
+    url: str,
+    local_filepath: str,
+    session: requests.Session,
+    total_size: int,
+    decoded_bytes: int,
+    mode: str,
+    range_header: dict[str, str] | None,
+    remote_mtime: float,
+) -> None:
+    """Download a file with a known size, optionally resuming."""
+    with tqdm(total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+        pbar.update(decoded_bytes)
+        with session.get(url, stream=True, headers=range_header) as response:
+            response.raise_for_status()
+            os.makedirs(os.path.dirname(os.path.abspath(local_filepath)), exist_ok=True)
+            with open(local_filepath, mode) as f:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+    if remote_mtime:
+        os.utime(local_filepath, (remote_mtime, remote_mtime))
+
+
+def download_file(url: str, local_filepath: str, session: requests.Session) -> None:
+    """Download a single file with resume support."""
     head_response = session.head(url)
     head_response.raise_for_status()
 
-    # Get Last-Modified header if available
     last_modified = head_response.headers.get('Last-Modified')
     if not last_modified:
         raise RuntimeError(f"Last-Modified header not found for {url}")
-
     remote_mtime = parse_http_date(last_modified)
 
-    # Check if file exists and should be skipped
     file_exists = os.path.exists(local_filepath)
-    if file_exists:
-        # Skip if no Content-Length header (we can't verify the download)
-        if 'Content-Length' not in head_response.headers:
-            print(f"File {local_filepath} exists and no Content-Length available - skipping")
-            return
+    if file_exists and 'Content-Length' not in head_response.headers:
+        print(f"File {local_filepath} exists and no Content-Length available - skipping")
+        return
 
-        # Skip if file size matches Content-Length
-        file_size = os.path.getsize(local_filepath)
-        if file_size == int(head_response.headers['Content-Length']):
+    if file_exists and 'Content-Length' in head_response.headers:
+        if os.path.getsize(local_filepath) == int(head_response.headers['Content-Length']):
             print(f"File {local_filepath} is already fully downloaded")
             return
 
-    # If Content-Length is not present, we'll do a simple download
     if 'Content-Length' not in head_response.headers:
         print(f"Content-Length not available, downloading {url}...")
-        with session.get(url, stream=True) as response:
-            response.raise_for_status()
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(os.path.abspath(local_filepath)), exist_ok=True)
-            with open(local_filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-            # Set the modification time if Last-Modified header was provided
-            if remote_mtime:
-                os.utime(local_filepath, (remote_mtime, remote_mtime))
+        _download_simple(url, local_filepath, session, remote_mtime)
         return
 
-    # Original download logic for files with Content-Length
-    total_size = int(head_response.headers['Content-Length'])
-    decoded_bytes_downloaded = 0
+    total_size, decoded_bytes, mode, range_header = _resolve_resume_state(
+        head_response, local_filepath
+    )
+    if decoded_bytes == 0 and mode == 'wb' and os.path.exists(local_filepath):
+        # Signal from _resolve_resume_state: file is already complete
+        return
 
-    if file_exists:
-        decoded_bytes_downloaded = os.path.getsize(local_filepath)
-        if decoded_bytes_downloaded >= total_size:
-            return
+    _download_chunked(url, local_filepath, session, total_size, decoded_bytes, mode, range_header, remote_mtime)
 
-    range_header = None
-    mode = 'ab' if decoded_bytes_downloaded > 0 else 'wb'
 
-    if decoded_bytes_downloaded > 0:
-        if head_response.headers.get('Accept-Ranges') != 'bytes':
-            print("Server does not support byte ranges, downloading from the beginning...")
-            decoded_bytes_downloaded = 0
-            mode = 'wb'
-        else:
-            range_header = {"Range": f"bytes={decoded_bytes_downloaded}-"}
+def _save_audiobook_metadata(data_dir: Path, response_text: str) -> None:
+    """Write working marker and page.json."""
+    (data_dir / "working").write_text(str(time.time()))
+    (data_dir / "page.json").write_text(response_text, encoding='utf-8')
 
-    with tqdm(total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
-        pbar.update(decoded_bytes_downloaded)
-        with session.get(url, stream=True, headers=range_header) as response:
-            response.raise_for_status()
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(os.path.abspath(local_filepath)), exist_ok=True)
-            with open(local_filepath, mode) as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-                        pbar.update(len(chunk))
 
-        # Set the modification time if Last-Modified header was provided
-        if remote_mtime:
-            os.utime(local_filepath, (remote_mtime, remote_mtime))
+def _download_episode(
+    src_file: dict, data_path: str, base_url: str, session: requests.Session
+) -> None:
+    """Resolve and download a single episode file."""
+    path = src_file.get("path")
+    if not path:
+        return
+
+    file_path = Path(f"{data_path}{path}")
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path = file_path.resolve()
+
+    try:
+        lr = session.get(f"{base_url}/api1/rs/{path}")
+        lr.raise_for_status()
+        file_url = lr.json().get("path")
+        if file_url:
+            download_file(f"{base_url}{file_url}", str(local_path), session)
+    except (requests.RequestException, ValueError) as e:
+        print(f"Error processing {path}: {e}")
 
 
 def download_audiobook(page: str, session: requests.Session) -> None:
-    """Download an audiobook from ICE Portal.
-
-    Args:
-        page: The page path for the audiobook
-        session: Requests session with authentication cookie
-    """
+    """Download an audiobook from ICE Portal."""
     base_url = "https://iceportal.de"
-    api_base_path = "/api1/rs/page"
-    data_base_path = "data"
+    data_path = f"data{page}"
 
-    api_base_url = f"{base_url}{api_base_path}"
-    data_path = f"{data_base_path}{page}"
-
-    r = session.get(f"{api_base_url}{page}/")
-
+    r = session.get(f"{base_url}/api1/rs/page{page}/")
     if r.status_code != 200:
-        print(f"HTTP {r.status_code} error accessing {api_base_url}{page}")
+        print(f"HTTP {r.status_code} error accessing {base_url}/api1/rs/page{page}/")
         return
 
-    # Create data directory and save metadata
     data_dir = Path(data_path)
     data_dir.mkdir(parents=True, exist_ok=True)
+    _save_audiobook_metadata(data_dir, r.text)
 
-    # Save working timestamp
-    working_file = data_dir / "working"
-    working_file.write_text(str(time.time()))
+    for src_file in r.json().get("files", []):
+        _download_episode(src_file, data_path, base_url, session)
 
-    # Save page data
-    page_file = data_dir / "page.json"
-    page_file.write_text(r.text, encoding='utf-8')
-
-    data = r.json()
-    files = data.get("files", [])
-
-    for src_file in files:
-        path = src_file.get("path")
-        if not path:
-            continue
-
-        file_path = Path(f"{data_path}{path}")
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path = file_path.resolve()
-
-        # Get the actual file URL
-        path_api_url = f"{base_url}/api1/rs/{path}"
-        try:
-            lr = session.get(path_api_url)
-            lr.raise_for_status()
-            file_url = lr.json().get("path")
-            if file_url:
-                download_file(f"{base_url}{file_url}", str(local_path), session)
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error processing {path}: {e}")
-            continue
-
-    # Mark download as complete
     done_file = data_dir / "done"
     done_file.unlink(missing_ok=True)
     done_file.write_text(str(time.time()))
 
 
 def is_audiobook_present(page: str) -> bool:
-    """Check if an audiobook has already been downloaded.
-
-    Args:
-        page: The page path for the audiobook
-
-    Returns:
-        bool: True if the audiobook is already downloaded, False otherwise
-    """
-    data_path = f"data{page}"
-    done_path = Path(f"{data_path}/done")
-    working_path = Path(f"{data_path}/working")
-
-    # Currently disabled - always return False to force re-check
-    return False
+    """Check if an audiobook has already been downloaded."""
+    return Path(f"data{page}/done").exists()
 
 
-def main() -> None:
-    """Main entry point for the ICE Portal downloader."""
-    session = requests.Session()
-    try:
-        cookie = fetch_cookie(session)
-        session.headers["Cookie"] = cookie
-    except (requests.RequestException, RuntimeError) as e:
-        print(f"Error fetching cookie: {e}")
-        return
-
+def fetch_audiobook_list(session: requests.Session) -> list[dict]:
+    """Fetch and return the audiobook list from ICE Portal."""
     try:
         response = session.get("https://iceportal.de/api1/rs/page/hoerbuecher")
         response.raise_for_status()
-        hoerbuecher = response.json()["teaserGroups"][0]["items"]
+        return response.json()["teaserGroups"][0]["items"]
     except (requests.RequestException, KeyError) as e:
         print(f"Error fetching audiobook list: {e}")
-        return
+        return []
 
-    for item in hoerbuecher:
+
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(description="ICE Portal audiobook downloader")
+    parser.add_argument("--list", action="store_true", help="List available audiobooks")
+    parser.add_argument("--filter", type=str, default="", help="Filter audiobooks by name (case-insensitive)")
+    return parser.parse_args()
+
+
+def _list_audiobooks(items: list[dict]) -> None:
+    """Print available audiobooks and their download status."""
+    for item in items:
+        nav = item.get("navigation", {})
+        title = nav.get("linktext", "Untitled")
+        href = nav.get("href", "")
+        status = "downloaded" if is_audiobook_present(href) else "not downloaded"
+        print(f"  {title} ({status})")
+
+
+def _download_all(items: list[dict], session: requests.Session) -> None:
+    """Download all audiobooks in the given list."""
+    for item in items:
         nav = item.get("navigation", {})
         if not nav:
             continue
@@ -217,16 +227,41 @@ def main() -> None:
             print(f"Skipping item with no href: {title}")
             continue
 
-        # Skip podcasts if needed
-        # if '/pc_' in href:
-        #     continue
-
         print(f"\nProcessing: {title}")
         if not is_audiobook_present(href):
             print("Starting download...")
             download_audiobook(href, session)
         else:
             print("Already downloaded - skipping")
+
+
+def main() -> None:
+    """Main entry point for the ICE Portal downloader."""
+    args = _parse_args()
+
+    session = requests.Session()
+    try:
+        cookie = fetch_cookie(session)
+        session.headers["Cookie"] = cookie
+    except (requests.RequestException, RuntimeError) as e:
+        print(f"Error fetching cookie: {e}")
+        return
+
+    hoerbuecher = fetch_audiobook_list(session)
+    if not hoerbuecher:
+        return
+
+    if args.filter:
+        hoerbuecher = [
+            item for item in hoerbuecher
+            if args.filter.lower() in item.get("navigation", {}).get("linktext", "").lower()
+        ]
+
+    if args.list:
+        _list_audiobooks(hoerbuecher)
+        return
+
+    _download_all(hoerbuecher, session)
 
 
 if __name__ == "__main__":
